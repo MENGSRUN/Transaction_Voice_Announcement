@@ -6,6 +6,10 @@ ESP32 firmware for a transaction voice speaker. The device connects to WiFi, sub
 
 This project is source-available for non-commercial use under the [PolyForm Noncommercial License 1.0.0](LICENSE).
 
+Official license text:
+
+https://spdx.org/licenses/PolyForm-Noncommercial-1.0.0.html
+
 You can:
 
 - Use it for personal, learning, research, school, hobby, charity, or government use
