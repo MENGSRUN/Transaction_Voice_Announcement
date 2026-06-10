@@ -33,7 +33,7 @@ Note: this is not an OSI-approved "open source" license because it restricts com
 - WiFi setup with WiFiManager captive portal
 - Optional built-in default WiFi fallback
 - MQTT transaction command listener
-- HTTPS MP3 download into RAM before playback
+- HTTPS MP3 download into a fixed RAM buffer before playback
 - Embedded cash-register MP3 sound stored in firmware
 - MAX98357A I2S audio output
 - SSD1306 OLED status display
@@ -95,15 +95,15 @@ Main configuration is in [src/main.cpp](src/main.cpp).
 Important constants:
 
 ```cpp
-const char* allowed_audio_host = "weknowyouknow.dev";
-const char* default_wifi_ssid = "...";
-const char* default_wifi_password = "...";
-char mqtt_server[40] = "192.168.1.120";
+const char* allowed_audio_host = "voice-service-api.weknowyouknow.dev";
+const char* default_wifi_ssid = "";
+const char* default_wifi_password = "";
+char mqtt_server[40] = "192.168.18.120";
 const int mqtt_port = 1883;
 const char* mqtt_topic = "store/transaction-voice/commands";
 ```
 
-If your MP3 URLs use a subdomain such as `voice-service-api.weknowyouknow.dev`, set `allowed_audio_host` to that exact host or update the validation logic.
+Leave the built-in WiFi values empty for normal use. Configure WiFi through the setup portal so real credentials are not compiled into firmware.
 
 ## Build, Upload, And Monitor
 
@@ -133,8 +133,9 @@ In VS Code PlatformIO, you can also use:
 On boot, the firmware tries this order:
 
 1. Load saved MQTT config from SPIFFS.
-2. Try the built-in default WiFi SSID/password.
-3. If that fails, open a WiFiManager setup AP.
+2. Keep a 5-second double-reset window for clearing settings.
+3. Try the optional built-in default WiFi SSID/password if configured.
+4. If that fails, open a WiFiManager setup AP.
 
 Setup AP:
 
@@ -181,32 +182,27 @@ Example:
 
 ```json
 {
-  "type": "transaction_voice",
-  "alert_id": "example-id",
-  "source": "telegram_payway_aba",
-  "amount": 100,
-  "currency": "KHR",
-  "text": "Transaction received",
-  "audio_url": "https://weknowyouknow.dev/media/example.mp3",
-  "created_at": "2026-06-01T00:00:00Z"
+  "id": "example-id",
+  "url": "https://voice-service-api.weknowyouknow.dev/media/example.mp3"
 }
 ```
 
 Validation rules:
 
 - Topic must match `store/transaction-voice/commands`
-- Payload length must be between `1` and `1800` bytes
-- `type` must be `transaction_voice`
-- `audio_url` must be HTTP or HTTPS
-- `audio_url` host must match `allowed_audio_host`
-- URL path must contain `.mp3`
-- MP3 size must be greater than `0` and less than `192 KB`
+- Payload length must be between `1` and `512` bytes
+- `id` must be present
+- `url` must be HTTPS
+- `url` host must match `allowed_audio_host`
+- URL path must end with `.mp3` before any query string
+- MP3 size must be greater than `0` and less than `96 KB`
+- Up to 4 valid audio URLs are queued while the device is already busy
 
 ## Audio Flow
 
 When a valid MQTT message arrives:
 
-1. Download the voice MP3 into RAM.
+1. Download the voice MP3 into a fixed RAM buffer.
 2. Play the embedded cash-register sound from `include/cash_ding_mp3.h`.
 3. Play the downloaded transaction voice MP3.
 4. Free audio memory when playback finishes.
@@ -214,13 +210,13 @@ When a valid MQTT message arrives:
 Cash sound volume is controlled here:
 
 ```cpp
-dingOut->SetGain(0.55);
+dingOut->SetGain(0.65);
 ```
 
 Voice volume is controlled here:
 
 ```cpp
-out->SetGain(0.85);
+out->SetGain(1.0);
 ```
 
 ## OLED Status
@@ -252,7 +248,7 @@ Make sure monitor speed is `115200`.
 monitor_speed = 115200
 ```
 
-### `Ignoring invalid audio_url`
+### `Ignoring invalid url`
 
 Check `allowed_audio_host`. It must match the exact host in the URL.
 
@@ -274,9 +270,10 @@ Check:
 
 - ESP32 has WiFi
 - URL is reachable from the ESP32 network
-- MP3 file is smaller than `192 KB`
+- MP3 file is smaller than `96 KB`
 - Server returns HTTP `200`
 - HTTPS server supports ESP32 TLS connection
+- Server does not require HTTP redirects
 
 ### `ERROR: Failed to open audio memory`
 
@@ -289,7 +286,7 @@ The firmware downloads the whole MP3 before playing to avoid HTTPS streaming buf
 - MP3 format
 - Mono preferred
 - 22050 Hz or 44100 Hz
-- Small file size, under `192 KB`
+- Small file size, under `96 KB`
 
 ### No sound
 
@@ -313,6 +310,7 @@ platformio.ini            PlatformIO environment and dependencies
 
 ## Notes
 
-- The firmware uses `WiFiClientSecure.setInsecure()` for HTTPS downloads. This skips certificate validation.
-- Do not expose your MQTT broker publicly without authentication and network controls.
+- MQTT is intentionally unauthenticated in this firmware. Treat the LAN/VPN as the trust boundary and do not expose the broker publicly.
+- The firmware still uses `WiFiClientSecure.setInsecure()` for HTTPS downloads. This skips certificate validation; replace it with a pinned CA or PlatformIO embedded certificate bundle before using hostile networks.
+- Voice MP3 storage uses a fixed `96 KB` RAM buffer to avoid heap fragmentation. At `32 kbps`, that is roughly 24 seconds of audio.
 - Avoid committing real WiFi credentials to shared repositories.
