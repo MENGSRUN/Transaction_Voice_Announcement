@@ -5,116 +5,55 @@
 #include <FS.h>
 #include <SPIFFS.h>
 #include <memory>
+#include <new>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <math.h>
+#include <time.h>
 #include "AudioFileSource.h"
+#include "audio_stream_buffer.h"
+#include "audio_https_stream.h"
 #include "AudioFileSourceID3.h"
 #include "AudioFileSourcePROGMEM.h"
 #include "AudioGeneratorMP3.h"
 #include "AudioOutputI2S.h"
 #include "cash_ding_mp3.h"
+#include "audio_url_validation.h"
+#include "letsencrypt_root_ca.h"
+#include "wifi_credentials.h"
 #include <WiFiManager.h> // Install "WiFiManager" by tzapu via Library Manager
 
-const char* allowed_audio_host = "weknowyouknow.dev"; // Media hosting must be on this domain and contain .mp3 in path to be played. This is a security measure to prevent abuse.
+const char* allowed_audio_host = "voice-service-api.weknowyouknow.dev"; // Media hosting must be on this exact domain and contain .mp3 in path to be played.
 const unsigned long mqttReconnectIntervalMs = 5000;
-const char* default_wifi_ssid = "";      // Optional: put a lab-only default WiFi SSID here
-const char* default_wifi_password = "";  // Optional: put a lab-only default WiFi password here
+const bool useDefaultWiFi = true; // Set false to use WiFiManager's saved network/setup portal.
 const unsigned long defaultWifiTimeoutMs = 15000;
-const int ledPin = -1; // GPIO22 is used for OLED SCL. Set another GPIO here if you wire an LED.
-const int oledSdaPin = 23;
-const int oledSclPin = 22;
+const unsigned long clockSyncTimeoutMs = 10000;
+const unsigned long audioConnectTimeoutMs = 8000;
+const unsigned long audioRequestTimeoutMs = 10000;
+const unsigned long audioReadTimeoutMs = 5000;
+const unsigned long audioRetryDelayMs = 750;
+const uint8_t audioStreamConnectAttempts = 3;
+const int ledPin = -1; // The S3 board's RGB LED is not a plain active-low LED.
+const bool oledEnabled = false; // Set true when the optional OLED is connected.
+const int oledSdaPin = 8;
+const int oledSclPin = 9;
 const uint8_t oledAddress = 0x3C;
 const int screenWidth = 128;
 const int screenHeight = 64;
-const int i2sBclkPin = 26;
-const int i2sLrcPin = 25;
-const int i2sDoutPin = 27;
+const int i2sBclkPin = 4;
+const int i2sLrcPin = 5;
+const int i2sDoutPin = 6;
 const size_t maxAudioBytes = 64 * 1024; // About 16 seconds at the Voice Service 32 kbps MP3 profile.
 const size_t maxAudioUrlLength = 256;
 const uint8_t audioQueueDepth = 4;
 const float voiceGain = 1;
 const float cashDingGain = 0.7;
 const unsigned long i2sSettleMs = 80;
+const unsigned long audioFinishedDisplayDelayMs = 250;
 const unsigned long doubleResetWindowMs = 5000;
 const char* resetFlagPath = "/reset_flag";
-
-class AudioFileSourceMemory : public AudioFileSource {
-public:
-  AudioFileSourceMemory(const uint8_t *data, uint32_t len) {
-    open(data, len);
-  }
-
-  bool open(const uint8_t *data, uint32_t len) {
-    if (!data || len == 0) return false;
-    audioData = data;
-    audioLen = len;
-    pos = 0;
-    opened = true;
-    return true;
-  }
-
-  uint32_t read(void *data, uint32_t len) override {
-    if (!opened || !data || pos >= audioLen) return 0;
-
-    uint32_t remaining = audioLen - pos;
-    uint32_t toRead = len < remaining ? len : remaining;
-    memcpy(data, audioData + pos, toRead);
-    pos += toRead;
-    return toRead;
-  }
-
-  uint32_t readNonBlock(void *data, uint32_t len) override {
-    return read(data, len);
-  }
-
-  bool seek(int32_t offset, int dir) override {
-    if (!opened) return false;
-
-    int32_t newPos = 0;
-    if (dir == SEEK_SET) {
-      newPos = offset;
-    } else if (dir == SEEK_CUR) {
-      newPos = pos + offset;
-    } else if (dir == SEEK_END) {
-      newPos = audioLen + offset;
-    } else {
-      return false;
-    }
-
-    if (newPos < 0 || (uint32_t)newPos > audioLen) return false;
-    pos = newPos;
-    return true;
-  }
-
-  bool close() override {
-    opened = false;
-    audioData = NULL;
-    audioLen = 0;
-    pos = 0;
-    return true;
-  }
-
-  bool isOpen() override {
-    return opened;
-  }
-
-  uint32_t getSize() override {
-    return audioLen;
-  }
-
-  uint32_t getPos() override {
-    return pos;
-  }
-
-private:
-  const uint8_t *audioData = NULL;
-  uint32_t audioLen = 0;
-  uint32_t pos = 0;
-  bool opened = false;
-};
 
 // --------------------------------------------------------------------------------
 // CONFIGURATION
@@ -122,7 +61,9 @@ private:
 // WiFi credentials are now managed by WiFiManager (Web Interface)
 char mqtt_server[40] = "192.168.18.120"; // Default IP, will be overwritten by config
 const int mqtt_port = 1883;
-const char* mqtt_topic = "store/transaction-voice/commands";
+const char* mqtt_topic = "store1/transaction-voice/commands";
+const char* mqtt_status_topic = "store1/transaction-voice/status";
+const size_t maxTransactionIdLength = 64;
 
 // --------------------------------------------------------------------------------
 // OBJECTS
@@ -137,9 +78,15 @@ AudioFileSourceID3 *id3;
 AudioOutputI2S *out;
 
 alignas(8) uint8_t mp3Preallocate[AudioGeneratorMP3::preAllocSize()];
-uint8_t *downloadedAudio = NULL;
-size_t downloadedAudioSize = 0;
-char audioQueue[audioQueueDepth][maxAudioUrlLength];
+AudioHttpsStream *audioStream = NULL;
+uint8_t streamBufferMemory[8 * 1024]; // Two seconds at 32 kbps.
+struct AudioCommand {
+  char id[maxTransactionIdLength + 1];
+  char url[maxAudioUrlLength];
+};
+
+AudioCommand audioQueue[audioQueueDepth];
+AudioCommand currentCommand = {};
 uint8_t audioQueueHead = 0;
 uint8_t audioQueueTail = 0;
 uint8_t audioQueueCount = 0;
@@ -163,15 +110,17 @@ void setupDisplay();
 void showStatus(const char* line1, const char* line2 = "", const char* line3 = "");
 void showSpeakFace();
 bool isAllowedAudioUrl(const char* url);
-bool enqueueAudioUrl(const char* url);
-bool dequeueAudioUrl(char* url, size_t urlSize);
+bool enqueueAudioCommand(const char* id, const char* url);
+bool dequeueAudioCommand(AudioCommand& command);
+void publishTransactionStatus(const char* id, const char* status, const char* detail = NULL);
 void processQueuedAudio();
-bool ensureAudioBuffer();
-bool downloadAudio(const char* url);
+bool openAudioStream(const char* url);
+bool waitForWiFi(unsigned long timeoutMs);
 bool connectDefaultWiFi();
-void playAudio(const char* url);
+bool syncClock();
+bool playAudio(const char* url);
 void stopAudio();
-void setupAudioOutput();
+bool setupAudioOutput();
 void playCashDing();
 void waitForAudioOutputSettle();
 void resetSavedConfig();
@@ -201,6 +150,10 @@ void ledToggle() {
 }
 
 void setupDisplay() {
+  if (!oledEnabled) {
+    Serial.println("OLED disabled; running without display");
+    return;
+  }
   Wire.begin(oledSdaPin, oledSclPin);
   displayReady = display.begin(SSD1306_SWITCHCAPVCC, oledAddress);
   if (!displayReady) {
@@ -344,6 +297,7 @@ void setup() {
 
   Serial.println("\nWiFi connected");
   showStatus("WiFi connected", WiFi.localIP().toString().c_str(), mqtt_server);
+  syncClock();
 
   // 2. Setup MQTT
   Serial.print("MQTT Server: ");
@@ -395,7 +349,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   }
 
   const char* id = doc["id"];
-  if (!id || strlen(id) == 0) {
+  if (!id || strlen(id) == 0 || strlen(id) > maxTransactionIdLength) {
     Serial.println("Ignoring message with invalid id");
     return;
   }
@@ -406,15 +360,17 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     return;
   }
 
-  if (!enqueueAudioUrl(audio_url)) {
+  if (!enqueueAudioCommand(id, audio_url)) {
     Serial.println("Audio queue full. Dropping transaction voice.");
     showStatus("Queue full", "Voice dropped");
+    publishTransactionStatus(id, "rejected", "queue full");
     return;
   }
 
   Serial.printf("Transaction ID: %s\n", id);
   Serial.printf("Queued URL: %s\n", audio_url);
   showStatus("Voice queued", "Waiting playback...");
+  publishTransactionStatus(id, "queued");
 }
 
 // --------------------------------------------------------------------------------
@@ -427,32 +383,12 @@ void audioStatusCallback(void *cbData, int code, const char *string) {
 }
 
 bool isAllowedAudioUrl(const char* url) {
-  if (!url) return false;
-
-  const char* hostStart = NULL;
-  if (strncmp(url, "https://", 8) == 0) {
-    hostStart = url + 8;
-  } else {
-    return false;
-  }
-
-  const char* pathStart = strchr(hostStart, '/');
-  if (!pathStart) return false;
-
-  size_t hostLen = pathStart - hostStart;
-  if (hostLen != strlen(allowed_audio_host) || strncmp(hostStart, allowed_audio_host, hostLen) != 0) {
-    return false;
-  }
-
-  const char* pathEnd = strpbrk(pathStart, "?#");
-  size_t pathLen = pathEnd ? (size_t)(pathEnd - pathStart) : strlen(pathStart);
-  if (pathLen < 4) return false;
-
-  return strncmp(pathStart + pathLen - 4, ".mp3", 4) == 0;
+  return isAllowedMp3HttpsUrl(url, allowed_audio_host);
 }
 
-bool enqueueAudioUrl(const char* url) {
-  if (!url || strlen(url) >= maxAudioUrlLength) {
+bool enqueueAudioCommand(const char* id, const char* url) {
+  if (!id || !strlen(id) || strlen(id) > maxTransactionIdLength ||
+      !url || strlen(url) >= maxAudioUrlLength) {
     return false;
   }
 
@@ -460,142 +396,105 @@ bool enqueueAudioUrl(const char* url) {
     return false;
   }
 
-  strlcpy(audioQueue[audioQueueTail], url, maxAudioUrlLength);
+  strlcpy(audioQueue[audioQueueTail].id, id, sizeof(audioQueue[audioQueueTail].id));
+  strlcpy(audioQueue[audioQueueTail].url, url, sizeof(audioQueue[audioQueueTail].url));
   audioQueueTail = (audioQueueTail + 1) % audioQueueDepth;
   audioQueueCount++;
   return true;
 }
 
-bool dequeueAudioUrl(char* url, size_t urlSize) {
-  if (!url || urlSize == 0 || audioQueueCount == 0) {
+bool dequeueAudioCommand(AudioCommand& command) {
+  if (audioQueueCount == 0) {
     return false;
   }
 
-  strlcpy(url, audioQueue[audioQueueHead], urlSize);
-  audioQueue[audioQueueHead][0] = '\0';
+  command = audioQueue[audioQueueHead];
+  audioQueue[audioQueueHead] = {};
   audioQueueHead = (audioQueueHead + 1) % audioQueueDepth;
   audioQueueCount--;
   return true;
 }
 
-void processQueuedAudio() {
-  if (isPlaying) return;
+void publishTransactionStatus(const char* id, const char* status, const char* detail) {
+  if (!client.connected() || !id || !status) return;
 
-  char nextUrl[maxAudioUrlLength];
-  if (!dequeueAudioUrl(nextUrl, sizeof(nextUrl))) {
+  JsonDocument doc;
+  doc["id"] = id;
+  doc["status"] = status;
+  if (detail && strlen(detail)) doc["detail"] = detail;
+
+  char payload[256];
+  size_t length = serializeJson(doc, payload, sizeof(payload));
+  if (length == 0 || length >= sizeof(payload)) {
+    Serial.println("Failed to serialize transaction status");
     return;
   }
 
-  Serial.printf("Playing queued URL: %s\n", nextUrl);
-  showStatus("Voice received", "Downloading audio...");
-  playAudio(nextUrl);
+  if (!client.publish(mqtt_status_topic, (const uint8_t*)payload, length, false)) {
+    Serial.printf("Failed to publish %s status for %s\n", status, id);
+  }
 }
 
-bool ensureAudioBuffer() {
-  if (downloadedAudio) {
-    return true;
+void processQueuedAudio() {
+  if (isPlaying) return;
+
+  if (!dequeueAudioCommand(currentCommand)) {
+    return;
   }
 
-  downloadedAudio = (uint8_t*)malloc(maxAudioBytes);
-  if (!downloadedAudio) {
-    Serial.printf("Failed to allocate reusable audio buffer: %u bytes\n", (unsigned)maxAudioBytes);
-    showStatus("Audio buffer", "No memory");
-    return false;
+  Serial.printf("Playing queued transaction %s: %s\n", currentCommand.id, currentCommand.url);
+  showStatus("Voice received", "Connecting stream...");
+  publishTransactionStatus(currentCommand.id, "processing");
+  if (!playAudio(currentCommand.url)) {
+    publishTransactionStatus(currentCommand.id, "failed", "audio could not start");
+    currentCommand = {};
+    showStatus("Voice failed", "Waiting for MQTT");
+  } else {
+    publishTransactionStatus(currentCommand.id, "playing");
   }
-
-  Serial.printf("Reusable audio buffer allocated: %u bytes\n", (unsigned)maxAudioBytes);
-  return true;
 }
 
-bool downloadAudio(const char* url) {
-  WiFiClientSecure secureClient;
-  HTTPClient http;
-  downloadedAudioSize = 0;
-
-  if (!isAllowedAudioUrl(url)) {
-    Serial.println("Rejected unsafe audio URL before download");
-    showStatus("Audio download", "Rejected URL");
+bool openAudioStream(const char* url) {
+  if (!isAllowedAudioUrl(url) || time(nullptr) < 1704067200) {
+    Serial.println("Rejected stream: unsafe URL or clock not synchronized");
     return false;
   }
+  audioStream = new (std::nothrow) AudioHttpsStream(
+      letsEncryptRootCa, audioConnectTimeoutMs, audioRequestTimeoutMs,
+      audioReadTimeoutMs, maxAudioBytes);
+  if (!audioStream) return false;
 
-  http.setTimeout(15000);
-  http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
-
-  secureClient.setInsecure();
-  bool begun = http.begin(secureClient, url);
-
-  if (!begun) {
-    Serial.println("HTTP begin failed");
-    showStatus("Audio download", "HTTP begin failed");
-    return false;
-  }
-
-  int code = http.GET();
-  if (code != HTTP_CODE_OK) {
-    Serial.printf("HTTP GET failed, code: %d\n", code);
-    showStatus("Audio download", "HTTP GET failed");
-    http.end();
-    return false;
-  }
-
-  int contentLength = http.getSize();
-  if (contentLength <= 0 || contentLength > (int)maxAudioBytes) {
-    Serial.printf("Invalid audio size: %d\n", contentLength);
-    showStatus("Audio download", "Invalid size");
-    http.end();
-    return false;
-  }
-
-  if (!ensureAudioBuffer()) {
-    http.end();
-    return false;
-  }
-
-  WiFiClient *stream = http.getStreamPtr();
-  size_t totalRead = 0;
-  unsigned long lastProgress = millis();
-
-  while (totalRead < (size_t)contentLength) {
-    int available = stream->available();
-    if (available > 0) {
-      size_t remaining = contentLength - totalRead;
-      size_t toRead = available < (int)remaining ? available : remaining;
-      int bytesRead = stream->read(downloadedAudio + totalRead, toRead);
-      if (bytesRead > 0) {
-        totalRead += bytesRead;
-        lastProgress = millis();
+  for (uint8_t attempt = 1; attempt <= audioStreamConnectAttempts; attempt++) {
+    Serial.printf("Audio stream connection attempt %u/%u\n", attempt, audioStreamConnectAttempts);
+    if (waitForWiFi(audioConnectTimeoutMs)) {
+      if (audioStream->open(url)) return true;
+      if (!audioStream->canRetry()) return false;
+    }
+    if (attempt < audioStreamConnectAttempts) {
+      unsigned long startedAt = millis();
+      while (millis() - startedAt < audioRetryDelayMs) {
+        if (client.connected()) client.loop();
+        delay(10);
       }
-    } else if (!http.connected()) {
-      break;
-    } else {
-      client.loop();
-      delay(1);
-    }
-
-    if (millis() - lastProgress > 5000) {
-      Serial.println("Audio download timed out");
-      showStatus("Audio download", "Timed out");
-      break;
     }
   }
+  return false;
+}
 
-  http.end();
+bool waitForWiFi(unsigned long timeoutMs) {
+  if (WiFi.status() == WL_CONNECTED) return true;
 
-  if (totalRead != (size_t)contentLength) {
-    Serial.printf("Audio download incomplete: %u/%d bytes\n", (unsigned)totalRead, contentLength);
-    showStatus("Audio download", "Incomplete");
-    downloadedAudioSize = 0;
-    return false;
+  Serial.println("WiFi disconnected; attempting reconnect...");
+  WiFi.reconnect();
+  unsigned long startedAt = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - startedAt < timeoutMs) {
+    delay(100);
   }
-
-  downloadedAudioSize = totalRead;
-  Serial.printf("Audio downloaded: %u bytes\n", (unsigned)downloadedAudioSize);
-  showStatus("Audio ready", "Starting voice...");
-  return true;
+  return WiFi.status() == WL_CONNECTED;
 }
 
 bool connectDefaultWiFi() {
-  if (!default_wifi_ssid || strlen(default_wifi_ssid) == 0) {
+  if (!useDefaultWiFi || default_wifi_ssid[0] == '\0') {
     return false;
   }
 
@@ -627,45 +526,101 @@ bool connectDefaultWiFi() {
   return false;
 }
 
-void playAudio(const char* url) {
+bool playAudio(const char* url) {
   stopAudio(); // Stop any current playback
 
-  if (!downloadAudio(url)) {
-    Serial.println("ERROR: Failed to download audio URL");
-    showStatus("Audio error", "Download failed");
+  if (!openAudioStream(url)) {
+    Serial.println("ERROR: Failed to open HTTPS audio stream");
+    showStatus("Audio error", "Stream failed");
     stopAudio();
-    return;
+    return false;
   }
 
-  playCashDing();
-
-  file = new AudioFileSourceMemory(downloadedAudio, downloadedAudioSize);
+  file = new (std::nothrow) AudioStreamBuffer(
+      audioStream, streamBufferMemory, sizeof(streamBufferMemory));
+  if (!file) {
+    Serial.println("ERROR: Failed to allocate stream buffer");
+    showStatus("Audio error", "No buffer memory");
+    stopAudio();
+    return false;
+  }
   file->RegisterStatusCB(audioStatusCallback, NULL);
   if (!file->isOpen()) {
-    Serial.println("ERROR: Failed to open audio memory");
-    showStatus("Audio error", "Memory open failed");
+    Serial.println("ERROR: Failed to open audio stream");
+    showStatus("Audio error", "Stream open failed");
     stopAudio();
-    return;
+    return false;
   }
 
-  id3 = new AudioFileSourceID3(file);
+  unsigned long bufferingStartedAt = millis();
+  auto* buffer = static_cast<AudioStreamBuffer*>(file);
+  if (!buffer->prime() || audioStream->hasFailed()) {
+    Serial.println("ERROR: Initial stream buffering failed");
+    stopAudio();
+    return false;
+  }
+  Serial.printf("Stream primed: %u bytes in %lu ms\n",
+                (unsigned)buffer->getFillLevel(), millis() - bufferingStartedAt);
+  // Prime before the ding so the accepted TLS connection is read immediately.
+  playCashDing();
+
+  id3 = new (std::nothrow) AudioFileSourceID3(file);
+  if (!id3) {
+    Serial.println("ERROR: Failed to allocate ID3 wrapper");
+    showStatus("Audio error", "No ID3 memory");
+    stopAudio();
+    return false;
+  }
   id3->RegisterStatusCB(audioStatusCallback, NULL);
 
-  setupAudioOutput();
+  if (!setupAudioOutput()) {
+    stopAudio();
+    return false;
+  }
 
-  mp3 = new AudioGeneratorMP3(mp3Preallocate, sizeof(mp3Preallocate));
+  waitForAudioOutputSettle();
+
+  mp3 = new (std::nothrow) AudioGeneratorMP3(mp3Preallocate, sizeof(mp3Preallocate));
+  if (!mp3) {
+    Serial.println("ERROR: Failed to allocate MP3 decoder");
+    showStatus("Audio error", "No MP3 memory");
+    stopAudio();
+    return false;
+  }
   mp3->RegisterStatusCB(audioStatusCallback, NULL);
   
   if (mp3->begin(id3, out)) {
-    Serial.println("MP3 playback started");
+    Serial.println("MP3 streaming playback started (8 KB buffer)");
     showSpeakFace();
     isPlaying = true;
     startPlayTime = millis();
+    return true;
   } else {
     Serial.println("ERROR: Failed to start MP3 playback (Check URL or Firewall)");
     showStatus("Audio error", "MP3 start failed");
     stopAudio();
+    return false;
   }
+}
+
+bool syncClock() {
+  Serial.println("Synchronizing clock for TLS validation...");
+  showStatus("Clock sync", "Waiting for NTP...");
+  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+
+  unsigned long startedAt = millis();
+  while (time(nullptr) < 1704067200 && millis() - startedAt < clockSyncTimeoutMs) {
+    delay(100);
+  }
+
+  if (time(nullptr) < 1704067200) {
+    Serial.println("Clock synchronization timed out; HTTPS audio is disabled until time is valid");
+    showStatus("Clock sync failed", "HTTPS unavailable");
+    return false;
+  }
+
+  Serial.println("Clock synchronized");
+  return true;
 }
 
 void stopAudio() {
@@ -679,7 +634,10 @@ void stopAudio() {
   if (file) {
     delete file; file = NULL;
   }
-  downloadedAudioSize = 0;
+  if (audioStream) {
+    delete audioStream;
+    audioStream = NULL;
+  }
   if (out) {
     delete out; out = NULL;
   }
@@ -687,32 +645,67 @@ void stopAudio() {
   ledWrite(true);
 }
 
-void setupAudioOutput() {
+bool setupAudioOutput() {
   if (out) {
     delete out;
     out = NULL;
   }
 
-  out = new AudioOutputI2S(0, AudioOutputI2S::EXTERNAL_I2S, 8, AudioOutputI2S::APLL_DISABLE);
+  out = new (std::nothrow) AudioOutputI2S(0, AudioOutputI2S::EXTERNAL_I2S, 8, AudioOutputI2S::APLL_DISABLE);
+  if (!out) {
+    Serial.println("ERROR: Failed to allocate I2S output");
+    showStatus("Audio error", "No I2S memory");
+    return false;
+  }
   out->SetPinout(i2sBclkPin, i2sLrcPin, i2sDoutPin);
   out->SetOutputModeMono(true);
   out->SetGain(voiceGain);
   Serial.println("I2S audio output ready");
+  return true;
 }
 
 void playCashDing() {
   showStatus("Cash ding", "Playing...");
 
-  AudioFileSourcePROGMEM *dingFile = new AudioFileSourcePROGMEM(cash_ding_mp3, cash_ding_mp3_len);
-  AudioFileSourceID3 *dingId3 = new AudioFileSourceID3(dingFile);
-  AudioOutputI2S *dingOut = new AudioOutputI2S(0, AudioOutputI2S::EXTERNAL_I2S, 8, AudioOutputI2S::APLL_DISABLE);
+  AudioFileSourcePROGMEM *dingFile = new (std::nothrow) AudioFileSourcePROGMEM(cash_ding_mp3, cash_ding_mp3_len);
+  if (!dingFile) {
+    Serial.println("Failed to allocate cash ding source");
+    showStatus("Cash ding", "No source memory");
+    return;
+  }
+
+  AudioFileSourceID3 *dingId3 = new (std::nothrow) AudioFileSourceID3(dingFile);
+  if (!dingId3) {
+    Serial.println("Failed to allocate cash ding ID3 wrapper");
+    showStatus("Cash ding", "No ID3 memory");
+    delete dingFile;
+    return;
+  }
+
+  AudioOutputI2S *dingOut = new (std::nothrow) AudioOutputI2S(0, AudioOutputI2S::EXTERNAL_I2S, 8, AudioOutputI2S::APLL_DISABLE);
+  if (!dingOut) {
+    Serial.println("Failed to allocate cash ding I2S output");
+    showStatus("Cash ding", "No I2S memory");
+    delete dingId3;
+    delete dingFile;
+    return;
+  }
   dingOut->SetPinout(i2sBclkPin, i2sLrcPin, i2sDoutPin);
   dingOut->SetOutputModeMono(true);
   dingOut->SetGain(cashDingGain);
   Serial.println("I2S audio output ready");
   waitForAudioOutputSettle();
 
-  AudioGeneratorMP3 *dingMp3 = new AudioGeneratorMP3(mp3Preallocate, sizeof(mp3Preallocate));
+  AudioGeneratorMP3 *dingMp3 = new (std::nothrow) AudioGeneratorMP3(mp3Preallocate, sizeof(mp3Preallocate));
+  if (!dingMp3) {
+    Serial.println("Failed to allocate cash ding MP3 decoder");
+    showStatus("Cash ding", "No MP3 memory");
+    delete dingId3;
+    delete dingFile;
+    delete dingOut;
+    return;
+  }
+
   if (!dingMp3->begin(dingId3, dingOut)) {
     Serial.println("Failed to play cash ding");
     delete dingMp3;
@@ -728,7 +721,6 @@ void playCashDing() {
       dingMp3->stop();
       break;
     }
-    client.loop();
     delay(1);
   }
 
@@ -744,7 +736,6 @@ void playCashDing() {
 void waitForAudioOutputSettle() {
   unsigned long startedAt = millis();
   while (millis() - startedAt < i2sSettleMs) {
-    client.loop();
     delay(1);
   }
 }
@@ -792,34 +783,52 @@ void loop() {
     clearResetFlag();
   }
 
-  // Handle MQTT Connection
-  if (!client.connected()) {
+  // Keep audio playback as the highest-priority loop work. MQTT reconnects and
+  // OLED refreshes can block long enough to starve the I2S DMA buffer.
+  if (!isPlaying && !client.connected()) {
     reconnect();
   }
-  client.loop();
+  if (client.connected()) {
+    client.loop();
+  }
 
   processQueuedAudio();
 
   // Handle Audio Playback
   if (isPlaying && mp3) {
     if (mp3->isRunning()) {
+      // The ID3 wrapper in ESP8266Audio 1.9.9 does not forward loop().
+      if (file) file->loop();
       if (!mp3->loop()) {
+        const bool complete = audioStream && audioStream->transferComplete();
+        if (audioStream && file) {
+          Serial.printf("Stream bytes: received %u/%u, consumed %u\n",
+                        (unsigned)audioStream->getPos(), (unsigned)audioStream->getSize(),
+                        (unsigned)file->getPos());
+        }
         mp3->stop();
-        Serial.print("Playback finished. Duration: ");
+        Serial.print(complete ? "Playback finished. Duration: " : "Stream failed. Duration: ");
         Serial.print(millis() - startPlayTime);
         Serial.println(" ms");
-        showStatus("Voice finished", "Waiting for MQTT");
+        delay(audioFinishedDisplayDelayMs);
         stopAudio();
+        publishTransactionStatus(currentCommand.id, complete ? "completed" : "failed",
+                                 complete ? NULL : "stream incomplete or decoder stopped early");
+        currentCommand = {};
+        showStatus(complete ? "Voice finished" : "Stream failed", "Waiting for MQTT");
       } else {
         // Blink LED while playing 
         if (millis() - lastBlinkTime > 100) { // Blink every 100ms
           lastBlinkTime = millis();
           ledToggle();
-          showSpeakFace();
         }
       }
     } else {
-      isPlaying = false;
+      Serial.println("Playback stopped unexpectedly");
+      publishTransactionStatus(currentCommand.id, "failed", "decoder stopped unexpectedly");
+      stopAudio();
+      currentCommand = {};
+      showStatus("Audio error", "Playback stopped");
     }
   }
 }
@@ -836,13 +845,19 @@ void reconnect() {
   Serial.print(mqtt_server);
   Serial.print("... ");
   showStatus("MQTT connecting", mqtt_server);
-  String clientId = "ESP32Client-";
-  clientId += String(random(0xffff), HEX);
+  char clientId[32];
+  uint64_t chipId = ESP.getEfuseMac();
+  snprintf(clientId, sizeof(clientId), "voice-%04X%08X",
+           (uint16_t)(chipId >> 32), (uint32_t)chipId);
   
-  if (client.connect(clientId.c_str())) {
+  // A stable client ID plus cleanSession=false lets a correctly configured
+  // broker retain QoS 1 commands while this device reconnects.
+  if (client.connect(clientId, NULL, NULL, NULL, 0, false, NULL, false)) {
     Serial.println("connected");
     showStatus("MQTT connected", mqtt_server, "Waiting voice...");
-    client.subscribe(mqtt_topic);
+    if (!client.subscribe(mqtt_topic, 1)) {
+      Serial.println("Failed to subscribe to command topic at QoS 1");
+    }
   } else {
     Serial.print("failed, rc=");
     Serial.print(client.state());
