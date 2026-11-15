@@ -170,25 +170,33 @@ void OledDisplay::showWiFiPortal(const char* apName) {
     display.display();
 }
 
-void OledDisplay::showReady(const char* ssid, int rssi, const char* ip, uint32_t txCount, int volumePercent) {
+void OledDisplay::showReady(const char* ssid, int rssi, const char* ip, uint32_t txCount, bool isOnline, int volumePercent) {
     if (!available) return;
     renderTopBar("LUYSOT", rssi, volumePercent);
 
-    // Blue section: Spacious, minimal, professional
-
-    // 1. Prominent Status badge (x=24, y=20, w=80, h=14)
-    display.drawRoundRect(22, 19, 84, 15, 3, SSD1306_WHITE);
-    display.fillCircle(30, 26, 2, SSD1306_WHITE);
-    display.setCursor(38, 23);
-    display.setTextSize(1);
-    display.print("READY TO PAY");
+    if (isOnline) {
+        // 1. Prominent Status badge (Online)
+        display.drawRoundRect(22, 19, 84, 15, 3, SSD1306_WHITE);
+        display.fillCircle(30, 26, 2, SSD1306_WHITE);
+        display.setCursor(38, 23);
+        display.setTextSize(1);
+        display.print("READY TO PAY");
+    } else {
+        // 1. Warning badge (Offline / Reconnecting)
+        display.fillRoundRect(16, 19, 96, 15, 3, SSD1306_WHITE);
+        display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
+        display.setCursor(22, 23);
+        display.setTextSize(1);
+        display.print("! RECONNECT !");
+        display.setTextColor(SSD1306_WHITE);
+    }
 
     // 2. WiFi Network line (y=38) - safely truncated, never wraps
     display.setCursor(4, 38);
     if (ssid && ssid[0]) {
         display.printf("WiFi: %.12s\n", ssid);
     } else {
-        display.println("WiFi: Connected");
+        display.println(isOnline ? "WiFi: Connected" : "WiFi: Offline");
     }
 
     // 3. Bottom Footer (y=52): IP on left, Tx counter on right

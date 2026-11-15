@@ -25,8 +25,8 @@ constexpr int SCREEN_HEIGHT = 64;
 // -----------------------------------------------------------------------------
 constexpr float VOICE_GAIN     = 1.0f;
 constexpr float CASH_DING_GAIN = 0.7f;
-constexpr size_t MAX_AUDIO_BYTES = 64 * 1024;    // 64 KB = ~16s of 32 kbps mono MP3
-constexpr size_t PSRAM_AUDIO_BUFFER_SIZE = 64 * 1024; // Pre-cache buffer in 8MB PSRAM
+constexpr size_t MAX_AUDIO_BYTES = 128 * 1024;          // 128 KB (~32s of 32kbps mono MP3)
+constexpr size_t PSRAM_AUDIO_BUFFER_SIZE = 128 * 1024; // Pre-cache buffer in 8MB PSRAM
 constexpr size_t MAX_AUDIO_URL_LENGTH = 256;
 constexpr size_t MAX_TRANSACTION_ID_LENGTH = 64;
 constexpr uint8_t AUDIO_QUEUE_DEPTH = 4;

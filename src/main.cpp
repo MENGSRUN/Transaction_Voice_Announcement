@@ -15,11 +15,35 @@ static bool displayNeedsReady = false;
 static uint32_t transactionCount = 0;
 static unsigned long lastScreenRefresh = 0;
 
-void onVoiceCommandReceived(const VoiceCommand& cmd) {
+// FIFO Transaction Queue for Rush-Hour Payments
+static VoiceCommand cmdQueue[AUDIO_QUEUE_DEPTH];
+static uint8_t queueHead = 0;
+static uint8_t queueTail = 0;
+static uint8_t queueCount = 0;
+
+static bool enqueueCommand(const VoiceCommand& cmd) {
+    if (queueCount >= AUDIO_QUEUE_DEPTH) {
+        return false;
+    }
+    cmdQueue[queueTail] = cmd;
+    queueTail = (queueTail + 1) % AUDIO_QUEUE_DEPTH;
+    queueCount++;
+    return true;
+}
+
+static bool dequeueCommand(VoiceCommand& outCmd) {
+    if (queueCount == 0) return false;
+    outCmd = cmdQueue[queueHead];
+    queueHead = (queueHead + 1) % AUDIO_QUEUE_DEPTH;
+    queueCount--;
+    return true;
+}
+
+static void playTransaction(const VoiceCommand& cmd) {
     activeCommand = cmd;
     transactionCount++;
 
-    Serial.printf("Main: Queued transaction #%lu (%s) for audio: %s\n",
+    Serial.printf("Main: Playing transaction #%lu (%s): %s\n",
                   (unsigned long)transactionCount, cmd.id, cmd.url);
 
     OledDisplay::showPlaying(cmd.id, transactionCount);
@@ -33,6 +57,22 @@ void onVoiceCommandReceived(const VoiceCommand& cmd) {
         displayNeedsReady = true;
     } else {
         MqttService::publishStatus(cmd.id, "playing");
+    }
+}
+
+void onVoiceCommandReceived(const VoiceCommand& cmd) {
+    if (!AudioPlayer::isPlaying() && activeCommand.id[0] == '\0') {
+        playTransaction(cmd);
+    } else {
+        // Audio is busy; queue the incoming transaction
+        if (enqueueCommand(cmd)) {
+            Serial.printf("Main: Audio busy. Queued transaction %s (queue: %d/%d)\n",
+                          cmd.id, queueCount, AUDIO_QUEUE_DEPTH);
+            MqttService::publishStatus(cmd.id, "queued");
+        } else {
+            Serial.printf("Main: Queue FULL! Dropping transaction %s\n", cmd.id);
+            MqttService::publishStatus(cmd.id, "failed", "queue full");
+        }
     }
 }
 
@@ -50,6 +90,18 @@ void onPlaybackComplete(bool success) {
     }
 
     completedAt = millis();
+
+    // Check if there are queued transactions waiting to be played
+    if (queueCount > 0) {
+        VoiceCommand nextCmd;
+        if (dequeueCommand(nextCmd)) {
+            Serial.printf("Main: Playing next queued transaction %s (%d remaining in queue)\n",
+                          nextCmd.id, queueCount);
+            playTransaction(nextCmd);
+            return;
+        }
+    }
+
     displayNeedsReady = true;
 }
 
@@ -98,7 +150,9 @@ void setup() {
     // 6. MQTT Subscriptions (QoS 1)
     MqttService::init(mqttServer, DEFAULT_MQTT_PORT, onVoiceCommandReceived);
 
-    OledDisplay::showReady(WiFi.SSID().c_str(), WiFi.RSSI(), WiFi.localIP().toString().c_str(), transactionCount);
+    bool isOnline = WiFi.isConnected() && MqttService::isConnected();
+    OledDisplay::showReady(WiFi.SSID().c_str(), WiFi.RSSI(), WiFi.localIP().toString().c_str(),
+                           transactionCount, isOnline);
     lastScreenRefresh = millis();
 
     Serial.println("Main: System initialization complete. Ready for voice jobs!\n");
@@ -111,17 +165,25 @@ void loop() {
         resetFlagHandled = true;
     }
 
+    bool isOnline = WiFi.isConnected() && MqttService::isConnected();
+    static bool lastOnline = true;
+
     // Reset screen back to Ready state after finishing transaction
     if (displayNeedsReady && (millis() - completedAt > 2500)) {
         displayNeedsReady = false;
-        OledDisplay::showReady(WiFi.SSID().c_str(), WiFi.RSSI(), WiFi.localIP().toString().c_str(), transactionCount);
+        OledDisplay::showReady(WiFi.SSID().c_str(), WiFi.RSSI(), WiFi.localIP().toString().c_str(),
+                               transactionCount, isOnline);
         lastScreenRefresh = millis();
     }
 
-    // Periodic screen refresh (every 10s) when idle to update WiFi signal strength bars
-    if (!AudioPlayer::isPlaying() && !displayNeedsReady && (millis() - lastScreenRefresh > 10000)) {
-        lastScreenRefresh = millis();
-        OledDisplay::showReady(WiFi.SSID().c_str(), WiFi.RSSI(), WiFi.localIP().toString().c_str(), transactionCount);
+    // Refresh screen if online status changed or periodic idle refresh (every 10s)
+    if (!AudioPlayer::isPlaying() && !displayNeedsReady) {
+        if (isOnline != lastOnline || millis() - lastScreenRefresh > 10000) {
+            lastOnline = isOnline;
+            lastScreenRefresh = millis();
+            OledDisplay::showReady(WiFi.SSID().c_str(), WiFi.RSSI(), WiFi.localIP().toString().c_str(),
+                                   transactionCount, isOnline);
+        }
     }
 
     // Real-time audio decode loop

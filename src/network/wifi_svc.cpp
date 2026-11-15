@@ -31,7 +31,9 @@ bool WiFiService::connect(char* mqttServerBuffer, size_t mqttServerLen) {
         Serial.println();
 
         if (WiFi.status() == WL_CONNECTED) {
-            Serial.printf("WiFiService: Connected via fallback credentials! IP: %s\n",
+            WiFi.setAutoReconnect(true);
+            WiFi.setSleep(false); // Disable modem sleep: reduces MQTT arrival latency to < 5ms
+            Serial.printf("WiFiService: Connected via fallback credentials! IP: %s (NoSleep enabled)\n",
                           WiFi.localIP().toString().c_str());
             return true;
         }
@@ -65,7 +67,9 @@ bool WiFiService::connect(char* mqttServerBuffer, size_t mqttServerLen) {
         ConfigStore::saveMqttServer(mqttServerBuffer);
     }
 
-    Serial.printf("WiFiService: WiFi Connected! Local IP: %s\n", WiFi.localIP().toString().c_str());
+    WiFi.setAutoReconnect(true);
+    WiFi.setSleep(false); // Disable modem sleep for instant response
+    Serial.printf("WiFiService: WiFi Connected! Local IP: %s (NoSleep enabled)\n", WiFi.localIP().toString().c_str());
     return true;
 }
 
