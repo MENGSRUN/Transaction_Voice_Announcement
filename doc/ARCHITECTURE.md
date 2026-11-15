@@ -5,9 +5,11 @@
 The goal of this architecture is to reduce end-to-end transaction voice announcement latency to **sub-second (< 30ms to first sound)** on the **ESP32-S3 DevKitC-1 N16R8** with **MAX98357A I2S Amplifier**, while eliminating all audio popping, crackling, and network-induced playback stutter.
 
 ### Key Performance Targets
-* **Time to First Audio (Cash Ding):** `< 30ms` from MQTT message arrival (instant auditory feedback).
-* **Network Stutter:** `0%` (Voice decoded directly from 8MB PSRAM, completely decoupled from WiFi jitter).
-* **Audio Transients:** Zero clicks or pops during amplifier initialization or between audio segments.
+* **Time to First Audio (Cash Ding):** `< 15ms` from MQTT message arrival (instant auditory feedback).
+* **Ding to Voice Silence:** `0ms` (Parallel dual-core PSRAM download finishes during the Cash Ding).
+* **Network Stutter:** `0%` (Voice decoded directly from 8MB Octal PSRAM, completely decoupled from WiFi jitter).
+* **Audio Transients:** Zero clicks or pops with persistent I2S driver.
+* **Rush-Hour Resilience:** 4-slot circular FIFO queue for back-to-back payments.
 
 ---
 

@@ -43,13 +43,13 @@ static void playTransaction(const VoiceCommand& cmd) {
     activeCommand = cmd;
     transactionCount++;
 
-    Serial.printf("Main: Playing transaction #%lu (%s): %s\n",
-                  (unsigned long)transactionCount, cmd.id, cmd.url);
+    // 1. FAST PATH (<2ms): Launch audio playback and background download immediately!
+    bool started = AudioPlayer::startVoiceStream(cmd.url);
 
+    // 2. Perform display update and MQTT publish while Ding is ALREADY ringing in the speaker
     OledDisplay::showPlaying(cmd.id, transactionCount);
-    MqttService::publishStatus(cmd.id, "processing");
 
-    if (!AudioPlayer::startVoiceStream(cmd.url)) {
+    if (!started) {
         OledDisplay::showError("Stream open failed");
         MqttService::publishStatus(cmd.id, "failed", "stream open failed");
         activeCommand = {};

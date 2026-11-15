@@ -33,6 +33,7 @@ bool WiFiService::connect(char* mqttServerBuffer, size_t mqttServerLen) {
         if (WiFi.status() == WL_CONNECTED) {
             WiFi.setAutoReconnect(true);
             WiFi.setSleep(false); // Disable modem sleep: reduces MQTT arrival latency to < 5ms
+            WiFi.setTxPower(WIFI_POWER_19_5dBm); // Max transmit power for lowest packet loss
             Serial.printf("WiFiService: Connected via fallback credentials! IP: %s (NoSleep enabled)\n",
                           WiFi.localIP().toString().c_str());
             return true;
@@ -69,6 +70,7 @@ bool WiFiService::connect(char* mqttServerBuffer, size_t mqttServerLen) {
 
     WiFi.setAutoReconnect(true);
     WiFi.setSleep(false); // Disable modem sleep for instant response
+    WiFi.setTxPower(WIFI_POWER_19_5dBm);
     Serial.printf("WiFiService: WiFi Connected! Local IP: %s (NoSleep enabled)\n", WiFi.localIP().toString().c_str());
     return true;
 }
